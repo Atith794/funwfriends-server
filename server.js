@@ -46,23 +46,6 @@ const imageStorage = multer.diskStorage({
   },
 });
 
-// const imageUpload = multer({
-//   storage: imageStorage,
-//   limits: {
-//     fileSize: 3 * 1024 * 1024, // 3 MB
-//   },
-//   fileFilter: (req, file, cb) => {
-//     const allowedTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
-
-//     if (!allowedTypes.includes(file.mimetype)) {
-//       cb(new Error("Only JPG, PNG, WEBP and GIF images are allowed"));
-//       return;
-//     }
-
-//     cb(null, true);
-//   },
-// });
-
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -123,10 +106,58 @@ redis.on("error", (err) => {
   console.log("Error in redis:", err);
 })
 
-redis.connect();
+redis.connect().then(async () => {
+  await redis.del("online:users");
+  console.log("Redis connected and old online users cleared");
+});
 
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "secret";
+async function getOnlineUsersCount() {
+  return await redis.sCard(keys.onlineUsers);
+}
+
+async function emitOnlineUsersCount() {
+  const onlineUsers = await getOnlineUsersCount();
+
+  console.log("[stats emit] online users:", onlineUsers);
+
+  io.emit("stats:online_users", {
+    onlineUsers,
+    updatedAt: Date.now(),
+  });
+}
+
+async function markUserOnline(userId, socketId) {
+  await redis.sAdd(keys.onlineUsers, userId);
+  await redis.sAdd(keys.userSocketIds(userId), socketId);
+
+  // Safety expiry in case server crashes before disconnect cleanup.
+  await redis.expire(keys.userSocketIds(userId), 60 * 60);
+}
+
+async function markUserOfflineSocket(userId, socketId) {
+  await redis.sRem(keys.userSocketIds(userId), socketId);
+
+  const remainingSockets = await redis.sCard(keys.userSocketIds(userId));
+
+  if (remainingSockets === 0) {
+    await redis.sRem(keys.onlineUsers, userId);
+    await redis.del(keys.userSocketIds(userId));
+  }
+}
+
+app.get("/stats/online-users", async (req, res) => {
+  const onlineUsers = await getOnlineUsersCount();
+
+  return res.json({
+    success: true,
+    onlineUsers,
+    socketMemoryCount: io.sockets.sockets.size,
+    updatedAt: Date.now(),
+  });
+});
+
+const PORT = process.env.PORT;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const ROOM_CAPACITY = 2;
 const MATCH_RADIUS_METERS = 50 + 1;
@@ -135,6 +166,9 @@ const OUT_OF_RADIUS_LIMIT = 5;
 const keys = {
   waitingUsers: "waiting:users",
   usersGeo: "geo:users",
+
+  onlineUsers: "online:users",
+  userSocketIds: (userId) => `online:user:${userId}:sockets`,
 
   roomOutOfRadiusCount: (roomId, userId) => `room:${roomId}:oor:${userId}`,
   user: (userId) => `user:${userId}`,
@@ -1023,11 +1057,15 @@ io.on("connection", async (socket) => {
     return;
   }
 
+  await markUserOnline(userId, socket.id);
+
   await redis.hSet(keys.user(userId), {
     socketId: socket.id,
     status: user.status === 'in_room' ? "in_room" : "waiting",
     updatedAt: String(Date.now()),
   });
+
+  await emitOnlineUsersCount();
 
   if (user.status === "in_room" && user.roomId) {
     socket.join(socketRoom(user.roomId));
@@ -1143,32 +1181,39 @@ io.on("connection", async (socket) => {
   });
 
   socket.on("disconnect", async () => {
-    console.log("Socket disconnected:", socket.id, userId);
+    try {
+      console.log("Socket disconnected:", socket.id, userId);
 
-    const user = await redis.hGetAll(keys.user(userId));
+      const user = await redis.hGetAll(keys.user(userId));
 
-    if (user.status === "in_room" && user.roomId) {
-      await closePairRoom({
-        roomId: user.roomId,
-        reason: "USER_DISCONNECTED",
-        offlineUserId: userId,
-        details: {
-          userId,
-        },
+      if (user.status === "in_room" && user.roomId) {
+        await closePairRoom({
+          roomId: user.roomId,
+          reason: "USER_DISCONNECTED",
+          offlineUserId: userId,
+          details: {
+            userId,
+          },
+        });
+
+        return;
+      }
+
+      await redis.sRem(keys.waitingUsers, userId);
+      await redis.zRem(keys.usersGeo, userId);
+
+      await redis.hSet(keys.user(userId), {
+        status: "offline",
+        socketId: "",
+        roomId: "",
+        updatedAt: String(Date.now()),
       });
-
-      return;
+    } catch (error) {
+      console.error("disconnect error:", error);
+    } finally {
+      await markUserOfflineSocket(userId, socket.id);
+      await emitOnlineUsersCount();
     }
-
-    await redis.sRem(keys.waitingUsers, userId);
-    await redis.zRem(keys.usersGeo, userId);
-
-    await redis.hSet(keys.user(userId), {
-      status: "offline",
-      socketId: "",
-      roomId: "",
-      updatedAt: String(Date.now()),
-    });
   });
 
   socket.on("message:send", async (payload, ack) => {
