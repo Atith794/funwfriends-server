@@ -17,8 +17,7 @@ app.use(express.json());
 
 app.use(
   cors({
-    // origin: process.env.FRONTEND_URL || '*'
-    origin: '*'
+    origin: process.env.FRONTEND_URL
   })
 )
 
@@ -92,8 +91,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    // origin: process.env.FRONTEND_URL || '*',
-    origin: '*',
+    origin: process.env.FRONTEND_URL,
     methods: ['GET', 'POST']
   }
 })
@@ -117,8 +115,6 @@ async function getOnlineUsersCount() {
 
 async function emitOnlineUsersCount() {
   const onlineUsers = await getOnlineUsersCount();
-
-  console.log("[stats emit] online users:", onlineUsers);
 
   io.emit("stats:online_users", {
     onlineUsers,
@@ -156,11 +152,103 @@ app.get("/stats/online-users", async (req, res) => {
   });
 });
 
+app.get("/app/runtime-config", async (req, res) => {
+  return res.json({
+    success: true,
+    config: {
+      isMaintenance: isMaintenanceMode,
+      Match_Radius: MATCH_RADIUS_METERS,
+    },
+    updatedAt: Date.now(),
+  });
+});
+
+app.post("/admin/runtime-config", async (req, res) => {
+  try {
+    const adminSecret = req.headers["x-admin-secret"];
+
+    if (
+      process.env.ADMIN_CONFIG_SECRET &&
+      adminSecret !== process.env.ADMIN_CONFIG_SECRET
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
+    }
+
+    const { isMaintenance, Match_Radius } = req.query;
+
+    const changes = {};
+
+    if (typeof Match_Radius !== "undefined") {
+      const newRadius = Number(Match_Radius);
+
+      if (!Number.isFinite(newRadius) || newRadius <= 0 || newRadius > 150) {
+        return res.status(400).json({
+          success: false,
+          message: "Match_Radius must be a valid positive number",
+        });
+      }
+
+      MATCH_RADIUS_METERS = newRadius;
+      changes.Match_Radius = MATCH_RADIUS_METERS;
+    }
+
+    if (typeof isMaintenance !== "undefined") {
+      const nextMaintenanceValue = String(isMaintenance).toLowerCase() === "true";
+
+      isMaintenanceMode = nextMaintenanceValue;
+      changes.isMaintenance = isMaintenanceMode;
+
+      if (isMaintenanceMode) {
+        io.emit("app:maintenance", {
+          isMaintenance: true,
+          message: "Website is under maintenance. Please try again later.",
+          updatedAt: Date.now(),
+        });
+
+        await moveAllUsersOfflineForMaintenance();
+
+        io.sockets.sockets.forEach((socket) => {
+          socket.disconnect(true);
+        });
+
+        await emitOnlineUsersCount();
+      } else {
+        io.emit("app:maintenance", {
+          isMaintenance: false,
+          message: "Website is back online.",
+          updatedAt: Date.now(),
+        });
+      }
+    }
+    
+    return res.json({
+      success: true,
+      message: "Runtime config updated",
+      config: {
+        isMaintenance: isMaintenanceMode,
+        Match_Radius: MATCH_RADIUS_METERS,
+      },
+      changes,
+    });
+  } catch (error) {
+    console.error("Runtime config update error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update runtime config",
+    });
+  }
+});
+
 const PORT = process.env.PORT;
 const JWT_SECRET = process.env.JWT_SECRET;
 
 const ROOM_CAPACITY = 2;
-const MATCH_RADIUS_METERS = 50 + 1;
+let isMaintenanceMode = false;
+let MATCH_RADIUS_METERS = Number(process.env.MATCH_RADIUS_METERS || 51);
 const OUT_OF_RADIUS_LIMIT = 5;
 
 const keys = {
@@ -181,6 +269,39 @@ const keys = {
   userLock: (userId) => `lock:user:${userId}`,
   roomLock: (roomId) => `lock:room:${roomId}`,
 };
+
+async function moveAllUsersOfflineForMaintenance() {
+  const sockets = Array.from(io.sockets.sockets.values());
+
+  for (const socket of sockets) {
+    const userId = socket.data.userId;
+
+    if (!userId) continue;
+
+    socket.data.disconnectedByMaintenance = true;
+
+    const user = await redis.hGetAll(keys.user(userId));
+
+    if (user?.roomId) {
+      await deleteRoomImages(user.roomId);
+      await redis.del(keys.room(user.roomId));
+      await redis.del(keys.roomMembers(user.roomId));
+    }
+
+    await redis.sRem(keys.waitingUsers, userId);
+    await redis.zRem(keys.usersGeo, userId);
+
+    await redis.hSet(keys.user(userId), {
+      status: "offline",
+      roomId: "",
+      socketId: "",
+      updatedAt: String(Date.now()),
+    });
+  }
+
+  await redis.del(keys.waitingUsers);
+  await redis.del(keys.usersGeo);
+}
 
 function socketRoom(roomId) {
   return `room:${roomId}`;
@@ -354,15 +475,12 @@ async function findNearbyWaitingUsers(userId, latitude, longitude) {
   console.log("Nearby users:", rawUsers)
 
   let candidates = [];
-  // console.log("rawUsers:", rawUsers)
   for (const eachUser of rawUsers) {
     const candidateId = eachUser[0];
     const distanceInMeters = Number(eachUser[1]);
 
     if (candidateId === userId) continue;
-    // console.log("User ID :", userId);
     const waitingUser = await redis.sIsMember(keys.waitingUsers, candidateId);
-    // console.log("Waiting user:", waitingUser)
     if (!waitingUser) continue;
 
     const candidateUser = await redis.hGetAll(keys.user(candidateId));
@@ -411,13 +529,6 @@ async function findNearbyWaitingUsersManual(userId, latitude, longitude, limit =
       candidateLongitude
     );
 
-    console.log("Manual distance check:", {
-      currentUserId: userId,
-      candidateId,
-      distanceInMeters,
-      allowedRadiusMeters: MATCH_RADIUS_METERS,
-    });
-
     if (distanceInMeters <= MATCH_RADIUS_METERS) {
       candidates.push({
         userId: candidateId,
@@ -450,11 +561,6 @@ async function tryAutoMatch(socket) {
 
   const latitude = Number(user.latitude);
   const longitude = Number(user.longitude);
-  // console.log("Current user location:", {
-  //     userId,
-  //     latitude,
-  //     longitude,
-  //   });
 
   // Commented for testing purpose
   // const candidates = await findNearbyWaitingUsers(userId, latitude, longitude);
@@ -462,7 +568,6 @@ async function tryAutoMatch(socket) {
   // Manual calculation
   const candidates = await findNearbyWaitingUsersManual(userId, latitude, longitude);
 
-  // console.log("Candidates:", candidates)
   for (const candidate of candidates) {
     const locked = await acquireUserLocks(userId, candidate.userId);
 
@@ -494,8 +599,6 @@ async function tryAutoMatch(socket) {
         Number(latestCandidate.latitude),
         Number(latestCandidate.longitude)
       );
-
-      console.log("Distance in meters:", distanceMeters)
 
       if (distanceMeters > MATCH_RADIUS_METERS) {
         console.log("Inside if condition")
@@ -730,37 +833,6 @@ async function checkPairDistance(socket, latitude, longitude, accuracy) {
   });
 }
 
-// async function deleteRoomImages(roomId) {
-//   try {
-//     const imageFilenames = await redis.sMembers(keys.roomImages(roomId));
-
-//     if (!imageFilenames.length) {
-//       await redis.del(keys.roomImages(roomId));
-//       return;
-//     }
-
-//     await Promise.all(
-//       imageFilenames.map(async (filename) => {
-//         const safeFileName = path.basename(filename);
-//         const filePath = path.join(chatImagesDir, safeFileName);
-
-//         try {
-//           await fs.promises.unlink(filePath);
-//           console.log("Deleted chat image:", filePath);
-//         } catch (error) {
-//           if (error.code !== "ENOENT") {
-//             console.error("Failed to delete chat image:", filePath, error);
-//           }
-//         }
-//       })
-//     );
-
-//     await redis.del(keys.roomImages(roomId));
-//   } catch (error) {
-//     console.error("deleteRoomImages error:", error);
-//   }
-// }
-
 async function deleteRoomImages(roomId) {
   try {
     const imageIds = await redis.sMembers(keys.roomImages(roomId));
@@ -784,11 +856,14 @@ async function deleteRoomImages(roomId) {
   }
 }
 
-/**
- * Only REST API.
- * User logs in and is marked as waiting.
- */
 app.post("/auth/login", async (req, res) => {
+  if (isMaintenanceMode) {
+    return res.status(503).json({
+      success: false,
+      isMaintenance: true,
+      message: "Website is under maintenance. Please try again later.",
+    });
+  }
   try {
     const { userId, name, latitude, longitude } = req.body;
 
@@ -849,6 +924,10 @@ app.post("/auth/login", async (req, res) => {
  */
 io.use((socket, next) => {
   try {
+    if (isMaintenanceMode) {
+      return next(new Error("Website is under maintenance. Please try again later."));
+    }
+
     const token = socket.handshake.auth?.token;
 
     if (!token) {
@@ -920,13 +999,6 @@ const sendImageMessageHandler = async (req, res) => {
     });
   }
 };
-
-// app.post(
-//   "/messages/image",
-//   authenticateRestRequest,
-//   imageUpload.single("image"),
-//   sendImageMessageHandler
-// );
 
 app.post(
   "/messages/image",
@@ -1183,6 +1255,9 @@ io.on("connection", async (socket) => {
   socket.on("disconnect", async () => {
     try {
       console.log("Socket disconnected:", socket.id, userId);
+      if (socket.data.disconnectedByMaintenance || isMaintenanceMode) {
+        return;
+      }
 
       const user = await redis.hGetAll(keys.user(userId));
 
@@ -1231,7 +1306,6 @@ io.on("connection", async (socket) => {
       }
 
       const user = await redis.hGetAll(keys.user(userId));
-      // console.log("User status:", user);
       if (user.status !== "in_room" || !user.roomId) {
         const response = {
           success: false,
