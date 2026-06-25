@@ -193,6 +193,12 @@ app.post("/admin/runtime-config", async (req, res) => {
 
       MATCH_RADIUS_METERS = newRadius;
       changes.Match_Radius = MATCH_RADIUS_METERS;
+
+      io.emit("app:runtime_config_updated", {
+        isMaintenance: isMaintenanceMode,
+        Match_Radius: MATCH_RADIUS_METERS,
+        updatedAt: Date.now()
+      })
     }
 
     if (typeof isMaintenance !== "undefined") {
