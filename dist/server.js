@@ -35,13 +35,24 @@ var loginLimiter = rateLimit({
   }
 });
 var imageUploadLimiter = rateLimit({
-  windowMs: 1 * 1e3,
-  limit: 10,
+  windowMs: 24 * 60 * 1e3,
+  limit: 5,
   standardHeaders: "draft-8",
   legacyHeaders: false,
-  message: {
-    success: false,
-    message: "Too many image upload attempts. Please try again later."
+  // message: {
+  //   success: false,
+  //   message: "Too many image upload attempts. Please try again later."
+  // }
+  handler: (req, res) => {
+    const retryAfterSeconds = Math.ceil(
+      (req.rateLimit.resetTime?.getTime() - Date.now()) / 1e3
+    );
+    return res.status(429).json({
+      success: false,
+      code: "IMAGE_UPLOAD_RATE_LIMIT_REACHED",
+      message: "Image upload limit reached. Please try again after some time.",
+      retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? Math.max(retryAfterSeconds, 1) : 60
+    });
   }
 });
 var imageFetchLimiter = rateLimit({
@@ -916,7 +927,7 @@ app.post(
           message: "Unsupported image type uploaded"
         });
       }
-      const imageBase64 = optimizedImage.toString("base64");
+      const imageBase64 = optimizedImage.buffer.toString("base64");
       await redis.hSet(imageKey, {
         imageId,
         roomId: user.roomId,
