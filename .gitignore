@@ -1,25 +1,13 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+node_modules/
 .env
+uploads/
+data/
 
-node_modules
-dist
-dist-ssr
-*.local
+# Ignore source files from git
+server.js
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+# But keep dist
+!dist/
+!dist/server.js
+!dist/package.json
+!dist/package-lock.json
