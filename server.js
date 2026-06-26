@@ -8,17 +8,77 @@ import jwt from 'jsonwebtoken';
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { rateLimit } from "express-rate-limit";
+import sharp from "sharp";
+import { buffer } from 'stream/consumers';
 
 dotenv.config();
 
 const app = express()
 
-app.use(express.json());
+app.set("trust proxy", 1)
+
+const globalRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 500,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many requests. Please try again later."
+  }
+})
+
+const loginLimiter = rateLimit({
+  windowMs: 1 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many login attempts. Please try again after some time."
+  }
+})
+
+const imageUploadLimiter = rateLimit({
+  windowMs: 1 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many image upload attempts. Please try again later."
+  }
+})
+
+const imageFetchLimiter = rateLimit({
+  windowMs: 1 * 1000,
+  limit: 100,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Toom any image fetch events. Please try again after some time."
+  }
+})
+
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many attempts. Try after some time."
+  }
+})
+
+app.use(express.json({ limit: "50kb" }));
+app.use(globalRateLimiter);
 
 app.use(
   cors({
-    // origin: process.env.FRONTEND_URL || '*'
-    origin: '*'
+    origin: process.env.FRONTEND_URL
   })
 )
 
@@ -46,30 +106,38 @@ const imageStorage = multer.diskStorage({
   },
 });
 
-// const imageUpload = multer({
-//   storage: imageStorage,
-//   limits: {
-//     fileSize: 3 * 1024 * 1024, // 3 MB
-//   },
-//   fileFilter: (req, file, cb) => {
-//     const allowedTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+async function optimizeChatImage(fileBuffer) {
+  const optimizedBuffer = await sharp(fileBuffer, {
+    failOn: "error",
+  })
+    .rotate()
+    .resize({
+      width: MAX_IMAGE_WIDTH,
+      height: MAX_IMAGE_HEIGHT,
+      fit: 'inside',
+      withoutEnlargement: true
+    })
+    .webp({
+      quality: IMAGE_QUALITY,
+      effort: 4
+    })
+    .toBuffer();
 
-//     if (!allowedTypes.includes(file.mimetype)) {
-//       cb(new Error("Only JPG, PNG, WEBP and GIF images are allowed"));
-//       return;
-//     }
-
-//     cb(null, true);
-//   },
-// });
+  return {
+    buffer: optimizedBuffer,
+    mimeType: "image/webp",
+    extension: "webp",
+    size: optimizedBuffer.length,
+  }
+}
 
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 2 * 1024 * 1024, // 2 MB recommended for Redis
+    fileSize: MAX_UPLOAD_IMAGE_BYTE_SIZE
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
 
     if (!allowedTypes.includes(file.mimetype)) {
       cb(new Error("Only JPG, PNG, WEBP and GIF images are allowed"));
@@ -109,32 +177,345 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    // origin: process.env.FRONTEND_URL || '*',
-    origin: '*',
+    origin: process.env.FRONTEND_URL,
     methods: ['GET', 'POST']
   }
 })
 
-const redis = createClient({
-  url: process.env.REDIS_URL
-})
+// const redis = createClient({
+//   url: process.env.REDIS_URL
+// })
 
-redis.on("error", (err) => {
-  console.log("Error in redis:", err);
-})
+// redis.on("error", (err) => {
+//   console.log("Error in redis:", err);
+// })
 
-redis.connect();
+// redis.connect().then(async () => {
+//   await redis.del("online:users");
+//   console.log("Redis connected and old online users cleared");
+// });
 
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "secret";
+let currentRedisUrl = process.env.REDIS_URL;
 
+function maskRedisUrl(redisUrl) {
+  try {
+    const parsedUrl = new URL(redisUrl);
+
+    if (parsedUrl.username) parsedUrl.username = "****";
+    if (parsedUrl.password) parsedUrl.password = "****";
+
+    return parsedUrl.toString();
+  } catch {
+    return "Invalid Redis URL";
+  }
+}
+
+function isValidRedisUrl(redisUrl) {
+  try {
+    const parsedUrl = new URL(redisUrl);
+
+    return parsedUrl.protocol === "redis:" || parsedUrl.protocol === "rediss:";
+  } catch {
+    return false;
+  }
+}
+
+function createRedisConnection(redisUrl) {
+  const client = createClient({
+    url: redisUrl,
+  });
+
+  client.on("error", (err) => {
+    console.log("Redis error:", err);
+  });
+
+  return client;
+}
+
+async function connectRedisClient(client) {
+  if (!client.isOpen) {
+    await client.connect();
+  }
+
+  await client.ping();
+}
+
+let redis = createRedisConnection(currentRedisUrl);
+
+connectRedisClient(redis)
+  .then(async () => {
+    await redis.del("online:users");
+    console.log("Redis connected and old online users cleared");
+  })
+  .catch((error) => {
+    console.error("Initial Redis connection failed:", error);
+    process.exit(1);
+  });
+
+function authenticateAdminRequest(req, res, next) {
+  const expectedSecret = process.env.ADMIN_CONFIG_SECRET;
+  const receivedSecret = req.headers["x-admin-secret"];
+
+  if (!expectedSecret) {
+    return res.status(500).json({
+      success: false,
+      message: "ADMIN_CONFIG_SECRET is not configured on the server",
+    });
+  }
+
+  if (!receivedSecret || receivedSecret !== expectedSecret) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
+  }
+
+  next();
+}
+
+async function getOnlineUsersCount() {
+  return await redis.sCard(keys.onlineUsers);
+}
+
+async function emitOnlineUsersCount() {
+  const onlineUsers = await getOnlineUsersCount();
+
+  io.emit("stats:online_users", {
+    onlineUsers,
+    updatedAt: Date.now(),
+  });
+}
+
+async function markUserOnline(userId, socketId) {
+  await redis.sAdd(keys.onlineUsers, userId);
+  await redis.sAdd(keys.userSocketIds(userId), socketId);
+
+  // Safety expiry in case server crashes before disconnect cleanup.
+  await redis.expire(keys.userSocketIds(userId), 60 * 60);
+}
+
+async function markUserOfflineSocket(userId, socketId) {
+  await redis.sRem(keys.userSocketIds(userId), socketId);
+
+  const remainingSockets = await redis.sCard(keys.userSocketIds(userId));
+
+  if (remainingSockets === 0) {
+    await redis.sRem(keys.onlineUsers, userId);
+    await redis.del(keys.userSocketIds(userId));
+  }
+}
+
+app.get("/stats/online-users", async (req, res) => {
+  const onlineUsers = await getOnlineUsersCount();
+
+  return res.json({
+    success: true,
+    onlineUsers,
+    socketMemoryCount: io.sockets.sockets.size,
+    updatedAt: Date.now(),
+  });
+});
+
+app.get("/app/runtime-config", adminLimiter, async (req, res) => {
+  return res.json({
+    success: true,
+    config: {
+      isMaintenance: isMaintenanceMode,
+      Match_Radius: MATCH_RADIUS_METERS,
+    },
+    updatedAt: Date.now(),
+  });
+});
+
+app.post("/admin/runtime-config", async (req, res) => {
+  try {
+    const adminSecret = req.headers["x-admin-secret"];
+
+    if (
+      process.env.ADMIN_CONFIG_SECRET &&
+      adminSecret !== process.env.ADMIN_CONFIG_SECRET
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized",
+      });
+    }
+
+    const { isMaintenance, Match_Radius } = req.query;
+
+    const changes = {};
+
+    if (typeof Match_Radius !== "undefined") {
+      const newRadius = Number(Match_Radius);
+
+      if (!Number.isFinite(newRadius) || newRadius <= 0 || newRadius > 150) {
+        return res.status(400).json({
+          success: false,
+          message: "Match_Radius must be a valid positive number",
+        });
+      }
+
+      MATCH_RADIUS_METERS = newRadius;
+      changes.Match_Radius = MATCH_RADIUS_METERS;
+
+      io.emit("app:runtime_config_updated", {
+        isMaintenance: isMaintenanceMode,
+        Match_Radius: MATCH_RADIUS_METERS,
+        updatedAt: Date.now()
+      })
+    }
+
+    if (typeof isMaintenance !== "undefined") {
+      const nextMaintenanceValue = String(isMaintenance).toLowerCase() === "true";
+
+      isMaintenanceMode = nextMaintenanceValue;
+      changes.isMaintenance = isMaintenanceMode;
+
+      if (isMaintenanceMode) {
+        io.emit("app:maintenance", {
+          isMaintenance: true,
+          message: "Website is under maintenance. Please try again later.",
+          updatedAt: Date.now(),
+        });
+
+        await moveAllUsersOfflineForMaintenance();
+
+        io.sockets.sockets.forEach((socket) => {
+          socket.disconnect(true);
+        });
+
+        await emitOnlineUsersCount();
+      } else {
+        io.emit("app:maintenance", {
+          isMaintenance: false,
+          message: "Website is back online.",
+          updatedAt: Date.now(),
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "Runtime config updated",
+      config: {
+        isMaintenance: isMaintenanceMode,
+        Match_Radius: MATCH_RADIUS_METERS,
+      },
+      changes,
+    });
+  } catch (error) {
+    console.error("Runtime config update error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update runtime config",
+    });
+  }
+});
+
+const PORT = process.env.PORT;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+const statsRoot = path.resolve("data");
+const dailyLoginStatsFile = path.join(statsRoot, "daily-logins.json");
+
+fs.mkdirSync(statsRoot, { recursive: true })
+
+if (!fs.existsSync(dailyLoginStatsFile)) {
+  fs.writeFileSync(dailyLoginStatsFile, JSON.stringify({}, null, 2), "utf-8");
+}
+
+let loginStatsWriteQueue = Promise.resolve();
+
+function getTodayLoginDateKey() {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: process.env.APP_TIMEZONE || "Asia/Kolkata",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  })
+
+  return formatter.format(new Date()).replace(/\//g, "-");
+}
+
+function dateKeyToTimestamp(dateKey) {
+  const [day, month, year] = dateKey.split('-').map(Number);
+
+  return new Date(year, month - 1, day).getTime();
+}
+
+function sortLoginStatsByDate(stats) {
+  return Object.fromEntries(
+    Object.entries(stats).sort(([dateA, dateB]) => {
+      return dateKeyToTimestamp(dateA) - dateKeyToTimestamp(dateB)
+    })
+  )
+}
+
+async function readDailyLoginStats() {
+  try {
+    const fileContent = await fs.promises.readFile(dailyLoginStatsFile, "utf-8");
+
+    if (!fileContent.trim()) {
+      return {};
+    }
+
+    return JSON.parse(fileContent);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return {};
+    }
+
+    throw error;
+  }
+}
+
+async function writeDailyLoginStats(stats) {
+  const sortedStats = sortLoginStatsByDate(stats);
+
+  const tempFile = `${dailyLoginStatsFile}.tmp`;
+
+  await fs.promises.writeFile(
+    tempFile,
+    JSON.stringify(sortedStats, null, 2),
+    "utf-8"
+  );
+
+  await fs.promises.rename(tempFile, dailyLoginStatsFile);
+
+  return sortedStats;
+}
+
+function recordDailyLogin() {
+  loginStatsWriteQueue = loginStatsWriteQueue.then(async () => {
+    const stats = await readDailyLoginStats();
+
+    const todayKey = getTodayLoginDateKey();
+
+    stats[todayKey] = Number(stats[todayKey] || 0) + 1;
+
+    return await writeDailyLoginStats(stats);
+  });
+
+  return loginStatsWriteQueue;
+}
+
+// CONSTANTS
 const ROOM_CAPACITY = 2;
-const MATCH_RADIUS_METERS = 50 + 1;
+let isMaintenanceMode = false;
+let MATCH_RADIUS_METERS = Number(process.env.MATCH_RADIUS_METERS || 51);
 const OUT_OF_RADIUS_LIMIT = 5;
+const MAX_UPLOAD_IMAGE_BYTE_SIZE = 4 * 1024 * 1024;
+const MAX_IMAGE_WIDTH = 1280;
+const MAX_IMAGE_HEIGHT = 1280;
+const IMAGE_QUALITY = 75;
 
 const keys = {
   waitingUsers: "waiting:users",
   usersGeo: "geo:users",
+
+  onlineUsers: "online:users",
+  userSocketIds: (userId) => `online:user:${userId}:sockets`,
 
   roomOutOfRadiusCount: (roomId, userId) => `room:${roomId}:oor:${userId}`,
   user: (userId) => `user:${userId}`,
@@ -147,6 +528,62 @@ const keys = {
   userLock: (userId) => `lock:user:${userId}`,
   roomLock: (roomId) => `lock:room:${roomId}`,
 };
+
+async function moveAllUsersOfflineForMaintenance() {
+  const sockets = Array.from(io.sockets.sockets.values());
+
+  for (const socket of sockets) {
+    const userId = socket.data.userId;
+
+    if (!userId) continue;
+
+    socket.data.disconnectedByMaintenance = true;
+
+    const user = await redis.hGetAll(keys.user(userId));
+
+    if (user?.roomId) {
+      await deleteRoomImages(user.roomId);
+      await redis.del(keys.room(user.roomId));
+      await redis.del(keys.roomMembers(user.roomId));
+    }
+
+    await redis.sRem(keys.waitingUsers, userId);
+    await redis.zRem(keys.usersGeo, userId);
+
+    await redis.hSet(keys.user(userId), {
+      status: "offline",
+      roomId: "",
+      socketId: "",
+      updatedAt: String(Date.now()),
+    });
+  }
+
+  await redis.del(keys.waitingUsers);
+  await redis.del(keys.usersGeo);
+}
+
+async function disconnectAllUsersForRedisSwitch() {
+  isMaintenanceMode = true;
+
+  io.emit("app:maintenance", {
+    isMaintenance: true,
+    message: "Server is switching Redis connection. Please reconnect after a few seconds.",
+    updatedAt: Date.now(),
+  });
+
+  try {
+    await moveAllUsersOfflineForMaintenance();
+  } catch (error) {
+    console.error("Failed to clean old Redis state before Redis switch:", error);
+  }
+
+  io.sockets.sockets.forEach((socket) => {
+    socket.data.disconnectedByMaintenance = true;
+    socket.disconnect(true);
+  });
+
+  await emitOnlineUsersCount();
+}
 
 function socketRoom(roomId) {
   return `room:${roomId}`;
@@ -320,15 +757,12 @@ async function findNearbyWaitingUsers(userId, latitude, longitude) {
   console.log("Nearby users:", rawUsers)
 
   let candidates = [];
-  // console.log("rawUsers:", rawUsers)
   for (const eachUser of rawUsers) {
     const candidateId = eachUser[0];
     const distanceInMeters = Number(eachUser[1]);
 
     if (candidateId === userId) continue;
-    // console.log("User ID :", userId);
     const waitingUser = await redis.sIsMember(keys.waitingUsers, candidateId);
-    // console.log("Waiting user:", waitingUser)
     if (!waitingUser) continue;
 
     const candidateUser = await redis.hGetAll(keys.user(candidateId));
@@ -377,13 +811,6 @@ async function findNearbyWaitingUsersManual(userId, latitude, longitude, limit =
       candidateLongitude
     );
 
-    console.log("Manual distance check:", {
-      currentUserId: userId,
-      candidateId,
-      distanceInMeters,
-      allowedRadiusMeters: MATCH_RADIUS_METERS,
-    });
-
     if (distanceInMeters <= MATCH_RADIUS_METERS) {
       candidates.push({
         userId: candidateId,
@@ -416,11 +843,6 @@ async function tryAutoMatch(socket) {
 
   const latitude = Number(user.latitude);
   const longitude = Number(user.longitude);
-  // console.log("Current user location:", {
-  //     userId,
-  //     latitude,
-  //     longitude,
-  //   });
 
   // Commented for testing purpose
   // const candidates = await findNearbyWaitingUsers(userId, latitude, longitude);
@@ -428,7 +850,6 @@ async function tryAutoMatch(socket) {
   // Manual calculation
   const candidates = await findNearbyWaitingUsersManual(userId, latitude, longitude);
 
-  // console.log("Candidates:", candidates)
   for (const candidate of candidates) {
     const locked = await acquireUserLocks(userId, candidate.userId);
 
@@ -460,8 +881,6 @@ async function tryAutoMatch(socket) {
         Number(latestCandidate.latitude),
         Number(latestCandidate.longitude)
       );
-
-      console.log("Distance in meters:", distanceMeters)
 
       if (distanceMeters > MATCH_RADIUS_METERS) {
         console.log("Inside if condition")
@@ -696,37 +1115,6 @@ async function checkPairDistance(socket, latitude, longitude, accuracy) {
   });
 }
 
-// async function deleteRoomImages(roomId) {
-//   try {
-//     const imageFilenames = await redis.sMembers(keys.roomImages(roomId));
-
-//     if (!imageFilenames.length) {
-//       await redis.del(keys.roomImages(roomId));
-//       return;
-//     }
-
-//     await Promise.all(
-//       imageFilenames.map(async (filename) => {
-//         const safeFileName = path.basename(filename);
-//         const filePath = path.join(chatImagesDir, safeFileName);
-
-//         try {
-//           await fs.promises.unlink(filePath);
-//           console.log("Deleted chat image:", filePath);
-//         } catch (error) {
-//           if (error.code !== "ENOENT") {
-//             console.error("Failed to delete chat image:", filePath, error);
-//           }
-//         }
-//       })
-//     );
-
-//     await redis.del(keys.roomImages(roomId));
-//   } catch (error) {
-//     console.error("deleteRoomImages error:", error);
-//   }
-// }
-
 async function deleteRoomImages(roomId) {
   try {
     const imageIds = await redis.sMembers(keys.roomImages(roomId));
@@ -750,11 +1138,14 @@ async function deleteRoomImages(roomId) {
   }
 }
 
-/**
- * Only REST API.
- * User logs in and is marked as waiting.
- */
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", loginLimiter, async (req, res) => {
+  if (isMaintenanceMode) {
+    return res.status(503).json({
+      success: false,
+      isMaintenance: true,
+      message: "Website is under maintenance. Please try again later.",
+    });
+  }
   try {
     const { userId, name, latitude, longitude } = req.body;
 
@@ -787,6 +1178,8 @@ app.post("/auth/login", async (req, res) => {
       userId,
     ]);
 
+    await recordDailyLogin();
+
     const token = jwt.sign({ userId }, JWT_SECRET, {
       expiresIn: "24h",
     });
@@ -815,6 +1208,10 @@ app.post("/auth/login", async (req, res) => {
  */
 io.use((socket, next) => {
   try {
+    if (isMaintenanceMode) {
+      return next(new Error("Website is under maintenance. Please try again later."));
+    }
+
     const token = socket.handshake.auth?.token;
 
     if (!token) {
@@ -887,15 +1284,9 @@ const sendImageMessageHandler = async (req, res) => {
   }
 };
 
-// app.post(
-//   "/messages/image",
-//   authenticateRestRequest,
-//   imageUpload.single("image"),
-//   sendImageMessageHandler
-// );
-
 app.post(
   "/messages/image",
+  imageUploadLimiter,
   authenticateRestRequest,
   imageUpload.single("image"),
   async (req, res) => {
@@ -925,15 +1316,29 @@ app.post(
       const imageKey = keys.chatImage(imageId);
       const roomImagesKey = keys.roomImages(user.roomId);
 
-      const imageBase64 = req.file.buffer.toString("base64");
+      let optimizedImage;
+
+      try {
+        optimizedImage = await optimizeChatImage(req.file.buffer);
+      } catch (e) {
+        return res.status(400).json({
+          success: false,
+          message: "Unsupported image type uploaded"
+        })
+      }
+
+      const imageBase64 = optimizedImage.toString("base64");
 
       await redis.hSet(imageKey, {
         imageId,
         roomId: user.roomId,
         from: userId,
-        mimeType: req.file.mimetype,
-        fileName: req.file.originalname,
-        size: String(req.file.size),
+        mimeType: optimizedImage.mimeType,
+        fileName: `${imageId}.${optimizedImage.extension}`,
+        originalMimeType: req.file.mimetype,
+        originalFileName: req.file.originalname,
+        originalSize: String(req.file.size),
+        size: String(optimizedImage.size),
         data: imageBase64,
         createdAt: String(Date.now()),
       });
@@ -953,9 +1358,11 @@ app.post(
         type: "image",
         imageId,
         imageUrl,
-        fileName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
+        fileName: `${imageId}.${optimizedImage.extension}`,
+        mimeType: optimizedImage.mimeType,
+        size: optimizedImage.size,
+        originalFileName: req.file.originalname,
+        originalSize: req.file.size,
         clientMessageId: req.body.clientMessageId || null,
         sentAt: Date.now(),
       };
@@ -978,7 +1385,7 @@ app.post(
   }
 );
 
-app.get("/api/messages/image/:imageId", async (req, res) => {
+app.get("/api/messages/image/:imageId", imageFetchLimiter, async (req, res) => {
   try {
     const { imageId } = req.params;
 
@@ -1007,6 +1414,137 @@ app.get("/api/messages/image/:imageId", async (req, res) => {
   }
 });
 
+app.get("/stats/daily-logins", async (req, res) => {
+  try {
+    const adminSecret = req.headers["x-admin-secret"];
+
+    if (process.env.ADMIN_CONFIG_SECRET && adminSecret !== process.env.ADMIN_CONFIG_SECRET) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorised"
+      });
+    }
+
+    const stats = await readDailyLoginStats();
+    const sortedStats = sortLoginStatsByDate(stats);
+
+    return res.json({
+      success: true,
+      data: sortedStats,
+      updatedAt: Date.now(),
+    });
+  } catch (error) {
+    console.error("Daily login stats fetch error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch daily login stats",
+    });
+  }
+});
+
+app.post(
+  "/admin/redis-url",
+  adminLimiter,
+  authenticateAdminRequest,
+  async (req, res) => {
+    let newRedis = null;
+
+    try {
+      const { redisUrl } = req.body || {};
+
+      if (!redisUrl || typeof redisUrl !== "string") {
+        return res.status(400).json({
+          success: false,
+          message: "redisUrl is required",
+        });
+      }
+
+      const trimmedRedisUrl = redisUrl.trim();
+
+      if (!isValidRedisUrl(trimmedRedisUrl)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid Redis URL. URL must start with redis:// or rediss://",
+        });
+      }
+
+      if (trimmedRedisUrl === currentRedisUrl) {
+        return res.json({
+          success: true,
+          message: "Redis URL is already using the provided value",
+          redis: {
+            url: maskRedisUrl(currentRedisUrl),
+          },
+        });
+      }
+
+      /**
+       * Important:
+       * First connect to the new Redis.
+       * Only if this succeeds, we disconnect users and replace the old client.
+       */
+      newRedis = createRedisConnection(trimmedRedisUrl);
+
+      await connectRedisClient(newRedis);
+
+      const oldRedis = redis;
+
+      await disconnectAllUsersForRedisSwitch();
+
+      redis = newRedis;
+      currentRedisUrl = trimmedRedisUrl;
+
+      /**
+       * This updates only the current Node.js process.
+       * It does NOT permanently update Render/env variables.
+       */
+      process.env.REDIS_URL = trimmedRedisUrl;
+
+      await redis.del(keys.onlineUsers);
+
+      try {
+        if (oldRedis?.isOpen) {
+          await oldRedis.quit();
+        }
+      } catch (error) {
+        console.error("Old Redis quit error:", error);
+
+        try {
+          oldRedis.disconnect();
+        } catch {}
+      }
+
+      isMaintenanceMode = false;
+
+      return res.json({
+        success: true,
+        message:
+          "Redis URL changed successfully. Existing users were disconnected and must login again.",
+        redis: {
+          url: maskRedisUrl(currentRedisUrl),
+          changedAt: Date.now(),
+        },
+      });
+    } catch (error) {
+      console.error("Redis URL change error:", error);
+
+      if (newRedis?.isOpen) {
+        try {
+          await newRedis.quit();
+        } catch {}
+      }
+
+      isMaintenanceMode = false;
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to change Redis URL",
+      });
+    }
+  }
+);
+
 io.on("connection", async (socket) => {
   const userId = socket.data.userId;
 
@@ -1023,11 +1561,15 @@ io.on("connection", async (socket) => {
     return;
   }
 
+  await markUserOnline(userId, socket.id);
+
   await redis.hSet(keys.user(userId), {
     socketId: socket.id,
     status: user.status === 'in_room' ? "in_room" : "waiting",
     updatedAt: String(Date.now()),
   });
+
+  await emitOnlineUsersCount();
 
   if (user.status === "in_room" && user.roomId) {
     socket.join(socketRoom(user.roomId));
@@ -1143,32 +1685,42 @@ io.on("connection", async (socket) => {
   });
 
   socket.on("disconnect", async () => {
-    console.log("Socket disconnected:", socket.id, userId);
+    try {
+      console.log("Socket disconnected:", socket.id, userId);
+      if (socket.data.disconnectedByMaintenance || isMaintenanceMode) {
+        return;
+      }
 
-    const user = await redis.hGetAll(keys.user(userId));
+      const user = await redis.hGetAll(keys.user(userId));
 
-    if (user.status === "in_room" && user.roomId) {
-      await closePairRoom({
-        roomId: user.roomId,
-        reason: "USER_DISCONNECTED",
-        offlineUserId: userId,
-        details: {
-          userId,
-        },
+      if (user.status === "in_room" && user.roomId) {
+        await closePairRoom({
+          roomId: user.roomId,
+          reason: "USER_DISCONNECTED",
+          offlineUserId: userId,
+          details: {
+            userId,
+          },
+        });
+
+        return;
+      }
+
+      await redis.sRem(keys.waitingUsers, userId);
+      await redis.zRem(keys.usersGeo, userId);
+
+      await redis.hSet(keys.user(userId), {
+        status: "offline",
+        socketId: "",
+        roomId: "",
+        updatedAt: String(Date.now()),
       });
-
-      return;
+    } catch (error) {
+      console.error("disconnect error:", error);
+    } finally {
+      await markUserOfflineSocket(userId, socket.id);
+      await emitOnlineUsersCount();
     }
-
-    await redis.sRem(keys.waitingUsers, userId);
-    await redis.zRem(keys.usersGeo, userId);
-
-    await redis.hSet(keys.user(userId), {
-      status: "offline",
-      socketId: "",
-      roomId: "",
-      updatedAt: String(Date.now()),
-    });
   });
 
   socket.on("message:send", async (payload, ack) => {
@@ -1186,7 +1738,6 @@ io.on("connection", async (socket) => {
       }
 
       const user = await redis.hGetAll(keys.user(userId));
-      // console.log("User status:", user);
       if (user.status !== "in_room" || !user.roomId) {
         const response = {
           success: false,
@@ -1230,6 +1781,31 @@ io.on("connection", async (socket) => {
     }
   });
 
+});
+
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({
+        success: false,
+        message: "Image is too large. Maximum allowed size is 4 MB.",
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+
+  if (error.message?.includes("Only JPG")) {
+    return res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+
+  next(error);
 });
 
 server.listen(PORT, () => {

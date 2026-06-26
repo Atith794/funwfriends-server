@@ -1,11 +1,13 @@
 {
   "name": "funwithfriends",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "dist/server.js",
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node dist/server.js",
+    "start:dist": "node server.js",
+    "build": "rimraf dist && esbuild server.js --bundle --platform=node --target=node20 --format=esm --packages=external --outfile=dist/server.js && cpx package.json dist && cpx package-lock.json dist"
   },
   "keywords": [],
   "author": "",
@@ -14,11 +16,18 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.2.0",
     "mysql2": "^3.22.5",
     "nodemon": "^3.1.14",
     "redis": "^6.0.0",
+    "sharp": "^0.35.2",
     "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "cpx": "^1.5.0",
+    "esbuild": "^0.28.1",
+    "rimraf": "^6.1.3"
   }
 }
