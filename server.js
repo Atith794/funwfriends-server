@@ -41,14 +41,10 @@ const loginLimiter = rateLimit({
 })
 
 const imageUploadLimiter = rateLimit({
-  windowMs: 24 * 60 * 1000,
+  windowMs: 24 * 60 * 60 * 1000,
   limit: 5,
   standardHeaders: "draft-8",
   legacyHeaders: false,
-  // message: {
-  //   success: false,
-  //   message: "Too many image upload attempts. Please try again later."
-  // }
   handler: (req, res) => {
     const retryAfterSeconds = Math.ceil(
       (req.rateLimit.resetTime?.getTime() - Date.now()) / 1000
@@ -72,7 +68,7 @@ const imageFetchLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     success: false,
-    message: "Toom any image fetch events. Please try again after some time."
+    message: "Too many image fetch events. Please try again after some time."
   }
 })
 
@@ -195,19 +191,6 @@ const io = new Server(server, {
     methods: ['GET', 'POST']
   }
 })
-
-// const redis = createClient({
-//   url: process.env.REDIS_URL
-// })
-
-// redis.on("error", (err) => {
-//   console.log("Error in redis:", err);
-// })
-
-// redis.connect().then(async () => {
-//   await redis.del("online:users");
-//   console.log("Redis connected and old online users cleared");
-// });
 
 let currentRedisUrl = process.env.REDIS_URL;
 
@@ -460,7 +443,7 @@ function dateKeyToTimestamp(dateKey) {
 
 function sortLoginStatsByDate(stats) {
   return Object.fromEntries(
-    Object.entries(stats).sort(([dateA, dateB]) => {
+    Object.entries(stats).sort(([dateA], [dateB]) => {
       return dateKeyToTimestamp(dateA) - dateKeyToTimestamp(dateB)
     })
   )

@@ -35,14 +35,10 @@ var loginLimiter = rateLimit({
   }
 });
 var imageUploadLimiter = rateLimit({
-  windowMs: 24 * 60 * 1e3,
+  windowMs: 24 * 60 * 60 * 1e3,
   limit: 5,
   standardHeaders: "draft-8",
   legacyHeaders: false,
-  // message: {
-  //   success: false,
-  //   message: "Too many image upload attempts. Please try again later."
-  // }
   handler: (req, res) => {
     const retryAfterSeconds = Math.ceil(
       (req.rateLimit.resetTime?.getTime() - Date.now()) / 1e3
@@ -62,7 +58,7 @@ var imageFetchLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     success: false,
-    message: "Toom any image fetch events. Please try again after some time."
+    message: "Too many image fetch events. Please try again after some time."
   }
 });
 var adminLimiter = rateLimit({
@@ -343,12 +339,14 @@ function getTodayLoginDateKey() {
   return formatter.format(/* @__PURE__ */ new Date()).replace(/\//g, "-");
 }
 function dateKeyToTimestamp(dateKey) {
+  console.log("Date Key:", dateKey);
   const [day, month, year] = dateKey.split("-").map(Number);
   return new Date(year, month - 1, day).getTime();
 }
 function sortLoginStatsByDate(stats) {
   return Object.fromEntries(
-    Object.entries(stats).sort(([dateA, dateB]) => {
+    Object.entries(stats).sort(([dateA], [dateB]) => {
+      console.log("dateA:", dateA, "dateB:", dateB);
       return dateKeyToTimestamp(dateA) - dateKeyToTimestamp(dateB);
     })
   );
@@ -368,6 +366,7 @@ async function readDailyLoginStats() {
   }
 }
 async function writeDailyLoginStats(stats) {
+  console.log("Stats:", stats);
   const sortedStats = sortLoginStatsByDate(stats);
   const tempFile = `${dailyLoginStatsFile}.tmp`;
   await fs.promises.writeFile(
